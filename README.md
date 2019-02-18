@@ -1,5 +1,5 @@
 # Machine Learning with a Heart
-## Classification models to predict whether a person has heart disease or not based on various parameters
+#### Classification models to predict whether a person has heart disease or not based on various parameters
 
 DrivenData Competition: https://www.drivendata.org/competitions/54/machine-learning-with-a-heart/
 
