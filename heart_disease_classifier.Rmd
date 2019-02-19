@@ -1,0 +1,195 @@
+---
+title: "Machine Learning with a heart"
+author: "Vaghul Aditya Balaji"
+date: "18/02/2019"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+Hello there! Let's get the ball rolling by importing the datasets and exploring them
+
+```{r}
+train <- read.csv("train_values.csv")
+test <- read.csv("test_values.csv")
+train_labels <- read.csv("train_labels.csv")
+train_labels$heart_disease_present <- as.factor(train_labels$heart_disease_present)
+test_ids <- test$patient_id
+
+table(train_labels$heart_disease_present)
+# it's good that the classes are not imbalanced
+```
+
+Now we have our datasets. Let's do some inital checks to make sure the data is okay. 
+
+```{r}
+# first, let's make sure the ordering of the training data and the disease indicator data match
+sum(train$patient_id != train_labels$patient_id)
+# so all the rows match which is a good start
+
+# let's now combine the train and test data together to aid us in the EDA and feature engineering phase
+df <- rbind(train, test)
+
+# we can drop the patient_id column
+df <- df[, !(colnames(df) %in% "patient_id")]
+
+# further analysis
+str(df)
+
+# checking for nulls
+colSums(is.na(df))
+# woah there are actually no NULLs! let me pinch myself to see if this is real!
+```
+
+Basic checks are done. Let's convert all those numeric columns which are supposed to be categories
+
+```{r}
+df$slope_of_peak_exercise_st_segment <- as.factor(df$slope_of_peak_exercise_st_segment)
+df$chest_pain_type <- as.factor(df$chest_pain_type)
+df$fasting_blood_sugar_gt_120_mg_per_dl <- as.factor(df$fasting_blood_sugar_gt_120_mg_per_dl)
+df$sex <- as.factor(df$slope_of_peak_exercise_st_segment)
+df$exercise_induced_angina <- as.factor(df$exercise_induced_angina)
+df$age <- as.factor(df$age)
+str(df)
+```
+
+Normally, the next step would be to deal with outliers in the data. However, we have <300 records so we'd start losing information if we started getting rid of entries. So, the next step would be to standardize our data.
+
+```{r}
+numeric_cols <- unlist(lapply(df, is.numeric))
+df[, numeric_cols] <- apply(df[, numeric_cols], 2, function(x) scale(x))
+```
+
+Now, let's create dummy variables for all the categorical features in our data (useful for Neural nets, Random forests)
+
+```{r}
+library(caret)
+dmy <- dummyVars(" ~ .", data = df, fullRank = TRUE)
+df_transformed <- data.frame(predict(dmy, newdata = df))
+```
+We could probably think about discretizing the age column but we'll come back to it later. As a final step, let's split up our training and test sets.
+
+```{r}
+train <- df[1:nrow(train), ]
+train_transformed <- df_transformed[1:nrow(train), ]
+
+test <- df[seq(nrow(train) + 1, nrow(df)), ]
+test_transformed <- df_transformed[seq(nrow(train) + 1, nrow(df_transformed)), ]
+
+train_numeric <- train[, numeric_cols] # needed for LDA, QDA, etc.
+```
+
+### Now, we are ready to start modeling!
+
+#### Random Forests
+
+```{r}
+set.seed(4521)
+library(MLmetrics)
+library(randomForest)
+rf_model <- randomForest(train_labels$heart_disease_present ~ ., data = train)
+LogLoss(predict(rf_model, type = "prob")[, 2], as.numeric(train_labels$heart_disease_present) - 1)
+```
+
+#### Linear Discriminant Analysis
+
+```{r}
+library(MASS)
+lda_model <- lda(train_labels$heart_disease_present ~ ., data = train_numeric, CV = TRUE)
+table(train_labels$heart_disease_present, lda_model$class)
+LogLoss(lda_model$posterior[, 2], as.numeric(train_labels$heart_disease_present) - 1)
+```
+
+#### Quadratic Discriminant Analysis
+
+```{r}
+qda_model <- qda(train_labels$heart_disease_present ~ ., data = train_numeric, CV = TRUE)
+table(train_labels$heart_disease_present, qda_model$class)
+LogLoss(qda_model$posterior[, 2], as.numeric(train_labels$heart_disease_present) - 1)
+```
+
+#### K-nearest neighbours
+
+```{r}
+# let's first determine the best value for 'k'
+library(class)
+knnruns <- list()
+for(i in 1:179){
+  knnruns[[i]] <- knn.cv(train_transformed, train_labels$heart_disease_present, k = i, prob = TRUE)
+}
+misclass <- unlist(lapply(knnruns, function(v) (nrow(train) - sum(diag(table(train_labels$heart_disease_present, v))))/nrow(train)))
+plot(misclass, xlab = "k", ylab = "Misclassification rate")
+k <- which.min(misclass)
+
+knn_model <- knnruns[[k]]
+table(train_labels$heart_disease_present, knn_model)
+probs <- attr(knn_model, "prob")
+(sum(-log(probs[train_labels$heart_disease_present == knn_model])) + sum(-log(1 - probs[train_labels$heart_disease_present != knn_model])))/nrow(train)
+```
+
+#### Logistic Regression
+
+```{r warning = FALSE}
+log_vec <- c()
+for(i in 1:nrow(train))
+{
+  logit_model <- glm(train_labels$heart_disease_present[-i] ~ ., data = train[-i, !(names(train) %in% "age")], family = "binomial")
+  pred_prob <- predict(logit_model, newdata = train[i, ], type = "response")
+  
+  if(train_labels$heart_disease_present[i] == 1)
+  {
+    log_vec <- c(log_vec, log(pred_prob))
+  } else {
+    log_vec <- c(log_vec, log(1 - pred_prob))
+  }
+}
+
+cv_lloss <- -mean(log_vec)
+cv_lloss
+# seems like logistic is the best model so far
+```
+
+#### And finally, Neural Nets
+
+```{r results = "hide"}
+library(nnet)
+library(NeuralNetTools)
+library(caret) # we need this as nnet doesn't give us probabilities directly
+set.seed(4521)
+
+# creating a method for caret to indicate 5-fold cross validation repeated 5 times
+fitControl <- trainControl(method = "repeatedcv", number = 5, repeats = 5)
+
+nn_model <- train(train_transformed, train_labels$heart_disease_present, method='nnet', trControl = fitControl, tuneGrid = expand.grid(size = 1:15, decay = seq(0.1, 1, 0.1)))
+```
+
+```{r}
+table(train_labels$heart_disease_present, predict.train(nn_model, newdata = train_transformed, type = "raw"))
+probs <- predict.train(nn_model, newdata = train_transformed, type = "prob")
+
+log_vec <- c()
+for(i in 1:nrow(probs))
+{
+  if(train_labels$heart_disease_present[i] == 1)
+  {
+    log_vec <- c(log_vec, log(probs$`1`[i]))
+  } else {
+    log_vec <- c(log_vec, log(probs$`0`[i]))
+  }
+}
+
+cv_lloss <- -mean(log_vec)
+cv_lloss
+# wow this is even better!
+```
+### Finally, submission time!
+
+```{r}
+# first, let's predict the classes for our test data
+final_preds <- predict.train(nn_model, newdata = test_transformed, type = "raw")
+final_probs <- predict.train(nn_model, newdata = test_transformed, type = "prob")
+final_df <- data.frame(patient_id = test_ids, heart_disease_present = final_probs$`1`)
+write.csv(final_df, file = "submission.csv", row.names = FALSE)
+```
